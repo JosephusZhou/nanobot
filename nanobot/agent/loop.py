@@ -14,6 +14,7 @@ from loguru import logger
 
 from nanobot.agent.context import ContextBuilder
 from nanobot.agent.memory import MemoryStore
+from nanobot.agent.model_routing import ModelRoute, select_route
 from nanobot.agent.subagent import SubagentManager
 from nanobot.agent.tools.cron import CronTool
 from nanobot.agent.tools.filesystem import EditFileTool, ListDirTool, ReadFileTool, WriteFileTool
@@ -64,6 +65,7 @@ class AgentLoop:
         restrict_to_workspace: bool = False,
         session_manager: SessionManager | None = None,
         mcp_servers: dict | None = None,
+        model_fallbacks: dict[str, ModelRoute] | None = None,
         channels_config: ChannelsConfig | None = None,
     ):
         from nanobot.config.schema import ExecToolConfig
@@ -99,10 +101,12 @@ class AgentLoop:
             exec_config=self.exec_config,
             restrict_to_workspace=restrict_to_workspace,
             mcp_servers=mcp_servers,
+            model_fallbacks=model_fallbacks,
         )
 
         self._running = False
         self._mcp_servers = mcp_servers or {}
+        self._model_fallbacks = model_fallbacks or {}
         self._mcp_stack: AsyncExitStack | None = None
         self._mcp_connected = False
         self._mcp_connecting = False
@@ -178,9 +182,28 @@ class AgentLoop:
             return f'{tc.name}("{val[:40]}…")' if len(val) > 40 else f'{tc.name}("{val}")'
         return ", ".join(_fmt(tc) for tc in tool_calls)
 
+    def _select_provider_and_model(self, task_text: str | None) -> tuple[LLMProvider, str]:
+        """Pick provider/model based on task route fallback config."""
+        route_name = select_route(task_text, self._model_fallbacks)
+        if not route_name:
+            return self.provider, self.model
+
+        route = self._model_fallbacks.get(route_name)
+        if not route:
+            return self.provider, self.model
+
+        logger.debug(
+            "Model fallback route selected: {} -> model '{}'",
+            route_name,
+            route.model,
+        )
+        return route.provider, route.model
+
     async def _run_agent_loop(
         self,
         initial_messages: list[dict],
+        provider: LLMProvider | None = None,
+        model: str | None = None,
         on_progress: Callable[..., Awaitable[None]] | None = None,
     ) -> tuple[str | None, list[str], list[dict]]:
         """Run the agent iteration loop. Returns (final_content, tools_used, messages)."""
@@ -188,14 +211,16 @@ class AgentLoop:
         iteration = 0
         final_content = None
         tools_used: list[str] = []
+        use_provider = provider or self.provider
+        use_model = model or self.model
 
         while iteration < self.max_iterations:
             iteration += 1
 
-            response = await self.provider.chat(
+            response = await use_provider.chat(
                 messages=messages,
                 tools=self.tools.get_definitions(),
-                model=self.model,
+                model=use_model,
                 temperature=self.temperature,
                 max_tokens=self.max_tokens,
                 reasoning_effort=self.reasoning_effort,
@@ -348,7 +373,11 @@ class AgentLoop:
                 history=history,
                 current_message=msg.content, channel=channel, chat_id=chat_id,
             )
-            final_content, _, all_msgs = await self._run_agent_loop(messages)
+            final_content, _, all_msgs = await self._run_agent_loop(
+                messages,
+                provider=self.provider,
+                model=self.model,
+            )
             self._save_turn(session, all_msgs, 1 + len(history))
             self.sessions.save(session)
             return OutboundMessage(channel=channel, chat_id=chat_id,
@@ -424,6 +453,7 @@ class AgentLoop:
             media=msg.media if msg.media else None,
             channel=msg.channel, chat_id=msg.chat_id,
         )
+        route_provider, route_model = self._select_provider_and_model(msg.content)
 
         async def _bus_progress(content: str, *, tool_hint: bool = False) -> None:
             meta = dict(msg.metadata or {})
@@ -434,7 +464,10 @@ class AgentLoop:
             ))
 
         final_content, _, all_msgs = await self._run_agent_loop(
-            initial_messages, on_progress=on_progress or _bus_progress,
+            initial_messages,
+            provider=route_provider,
+            model=route_model,
+            on_progress=on_progress or _bus_progress,
         )
 
         if final_content is None:

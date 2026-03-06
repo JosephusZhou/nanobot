@@ -66,4 +66,10 @@ def _migrate_config(data: dict) -> dict:
     exec_cfg = tools.get("exec", {})
     if "restrictToWorkspace" in exec_cfg and "restrictToWorkspace" not in tools:
         tools["restrictToWorkspace"] = exec_cfg.pop("restrictToWorkspace")
+
+    # Move agents.defaults.model-fallback → agents.defaults.modelFallback
+    agents = data.get("agents", {})
+    defaults = agents.get("defaults", {})
+    if "model-fallback" in defaults and "modelFallback" not in defaults:
+        defaults["modelFallback"] = defaults.pop("model-fallback")
     return data

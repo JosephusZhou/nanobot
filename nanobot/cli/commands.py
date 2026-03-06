@@ -200,40 +200,90 @@ def onboard():
 
 def _make_provider(config: Config):
     """Create the appropriate LLM provider from config."""
-    from nanobot.providers.custom_provider import CustomProvider
-    from nanobot.providers.litellm_provider import LiteLLMProvider
-    from nanobot.providers.openai_codex_provider import OpenAICodexProvider
-
     model = config.agents.defaults.model
     provider_name = config.get_provider_name(model)
-    p = config.get_provider(model)
+    if not provider_name:
+        console.print("[red]Error: No provider matched the configured model.[/red]")
+        console.print("Set providers/api keys in ~/.nanobot/config.json")
+        raise typer.Exit(1)
 
-    # OpenAI Codex (OAuth)
-    if provider_name == "openai_codex" or model.startswith("openai-codex/"):
-        return OpenAICodexProvider(default_model=model)
-
-    # Custom: direct OpenAI-compatible endpoint, bypasses LiteLLM
-    if provider_name == "custom":
-        return CustomProvider(
-            api_key=p.api_key if p else "no-key",
-            api_base=config.get_api_base(model) or "http://localhost:8000/v1",
-            default_model=model,
-        )
-
-    from nanobot.providers.registry import find_by_name
-    spec = find_by_name(provider_name)
-    if not model.startswith("bedrock/") and not (p and p.api_key) and not (spec and spec.is_oauth):
+    try:
+        return _make_provider_for(config, provider_name=provider_name, model=model)
+    except ValueError:
         console.print("[red]Error: No API key configured.[/red]")
         console.print("Set one in ~/.nanobot/config.json under providers section")
         raise typer.Exit(1)
 
+
+def _make_provider_for(config: Config, provider_name: str, model: str):
+    """Create provider instance for an explicit provider/model pair."""
+    from nanobot.providers.custom_provider import CustomProvider
+    from nanobot.providers.litellm_provider import LiteLLMProvider
+    from nanobot.providers.openai_codex_provider import OpenAICodexProvider
+    from nanobot.providers.registry import find_by_name
+
+    normalized_name = provider_name.strip().lower().replace("-", "_")
+    spec = find_by_name(normalized_name)
+    if not spec:
+        raise ValueError(f"Unknown provider: {provider_name}")
+    p = getattr(config.providers, normalized_name, None)
+
+    # OpenAI Codex (OAuth)
+    if normalized_name == "openai_codex" or model.startswith("openai-codex/"):
+        return OpenAICodexProvider(default_model=model)
+
+    # Custom: direct OpenAI-compatible endpoint, bypasses LiteLLM
+    if normalized_name == "custom":
+        return CustomProvider(
+            api_key=p.api_key if p else "no-key",
+            api_base=(p.api_base if p and p.api_base else "http://localhost:8000/v1"),
+            default_model=model,
+        )
+
+    if not model.startswith("bedrock/") and not (p and p.api_key) and not (spec and spec.is_oauth):
+        raise ValueError(f"No API key configured for provider '{normalized_name}'")
+
+    api_base = None
+    if p and p.api_base:
+        api_base = p.api_base
+    elif spec.default_api_base:
+        api_base = spec.default_api_base
+
     return LiteLLMProvider(
         api_key=p.api_key if p else None,
-        api_base=config.get_api_base(model),
+        api_base=api_base,
         default_model=model,
         extra_headers=p.extra_headers if p else None,
-        provider_name=provider_name,
+        provider_name=normalized_name,
     )
+
+
+def _build_model_fallbacks(config: Config) -> dict:
+    """Build task route -> provider/model mapping from config."""
+    from nanobot.agent.model_routing import ModelRoute
+
+    routes: dict[str, ModelRoute] = {}
+    for route_name, route_cfg in config.agents.defaults.model_fallback.items():
+        provider_name = (route_cfg.provider or "").strip()
+        model = (route_cfg.model or "").strip()
+        if not provider_name or not model:
+            console.print(
+                f"[yellow]Warning: Skip modelFallback.{route_name} (provider/model required).[/yellow]"
+            )
+            continue
+        try:
+            provider = _make_provider_for(config, provider_name=provider_name, model=model)
+        except Exception as e:
+            console.print(
+                f"[yellow]Warning: Skip modelFallback.{route_name} ({e}).[/yellow]"
+            )
+            continue
+        routes[route_name] = ModelRoute(
+            provider=provider,
+            model=model,
+            keywords=tuple(route_cfg.keywords),
+        )
+    return routes
 
 
 # ============================================================================
@@ -266,6 +316,7 @@ def gateway(
     sync_workspace_templates(config.workspace_path)
     bus = MessageBus()
     provider = _make_provider(config)
+    model_fallbacks = _build_model_fallbacks(config)
     session_manager = SessionManager(config.workspace_path)
 
     # Create cron service first (callback set after agent creation)
@@ -290,6 +341,7 @@ def gateway(
         restrict_to_workspace=config.tools.restrict_to_workspace,
         session_manager=session_manager,
         mcp_servers=config.tools.mcp_servers,
+        model_fallbacks=model_fallbacks,
         channels_config=config.channels,
     )
 
@@ -446,6 +498,7 @@ def agent(
 
     bus = MessageBus()
     provider = _make_provider(config)
+    model_fallbacks = _build_model_fallbacks(config)
 
     # Create cron service for tool usage (no callback needed for CLI unless running)
     cron_store_path = get_data_dir() / "cron" / "jobs.json"
@@ -472,6 +525,7 @@ def agent(
         cron_service=cron,
         restrict_to_workspace=config.tools.restrict_to_workspace,
         mcp_servers=config.tools.mcp_servers,
+        model_fallbacks=model_fallbacks,
         channels_config=config.channels,
     )
 

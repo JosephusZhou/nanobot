@@ -9,6 +9,7 @@ from typing import Any
 
 from loguru import logger
 
+from nanobot.agent.model_routing import ModelRoute, select_route
 from nanobot.agent.tools.filesystem import EditFileTool, ListDirTool, ReadFileTool, WriteFileTool
 from nanobot.agent.tools.registry import ToolRegistry
 from nanobot.agent.tools.shell import ExecTool
@@ -35,7 +36,8 @@ class SubagentManager:
         web_proxy: str | None = None,
         exec_config: "ExecToolConfig | None" = None,
         restrict_to_workspace: bool = False,
-        mcp_servers: dict | None = None
+        mcp_servers: dict | None = None,
+        model_fallbacks: dict[str, ModelRoute] | None = None,
     ):
         from nanobot.config.schema import ExecToolConfig
         self.provider = provider
@@ -50,6 +52,7 @@ class SubagentManager:
         self.exec_config = exec_config or ExecToolConfig()
         self.restrict_to_workspace = restrict_to_workspace
         self.mcp_servers = mcp_servers or {}
+        self.model_fallbacks = model_fallbacks or {}
         self._running_tasks: dict[str, asyncio.Task[None]] = {}
         self._session_tasks: dict[str, set[str]] = {}  # session_key -> {task_id, ...}
 
@@ -94,6 +97,13 @@ class SubagentManager:
     ) -> None:
         """Execute the subagent task and announce the result."""
         logger.info("Subagent [{}] starting task: {}", task_id, label)
+        route_name = select_route(task, self.model_fallbacks)
+        route = self.model_fallbacks.get(route_name) if route_name else None
+        use_provider = route.provider if route else self.provider
+        use_model = route.model if route else self.model
+        if route_name and route:
+            logger.debug("Subagent [{}] model fallback route selected: {} -> {}", task_id, route_name, use_model)
+
         try:
             # Build subagent tools (no message tool, no spawn tool)
             tools = ToolRegistry()
@@ -135,10 +145,10 @@ class SubagentManager:
                 while iteration < max_iterations:
                     iteration += 1
 
-                    response = await self.provider.chat(
+                    response = await use_provider.chat(
                         messages=messages,
                         tools=tools.get_definitions(),
-                        model=self.model,
+                        model=use_model,
                         temperature=self.temperature,
                         max_tokens=self.max_tokens,
                         reasoning_effort=self.reasoning_effort,

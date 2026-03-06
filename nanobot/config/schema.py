@@ -217,6 +217,14 @@ class ChannelsConfig(Base):
     matrix: MatrixConfig = Field(default_factory=MatrixConfig)
 
 
+class ModelFallbackConfig(Base):
+    """Per-task fallback model route."""
+
+    provider: str = ""  # Provider name from ProvidersConfig (e.g. "openrouter", "openai", "openai_codex")
+    model: str = ""  # Model name to use for this task route
+    keywords: list[str] = Field(default_factory=list)  # Optional route trigger keywords
+
+
 class AgentDefaults(Base):
     """Default agent configuration."""
 
@@ -228,6 +236,7 @@ class AgentDefaults(Base):
     max_tool_iterations: int = 40
     memory_window: int = 100
     reasoning_effort: str | None = None  # low / medium / high — enables LLM thinking mode
+    model_fallback: dict[str, ModelFallbackConfig] = Field(default_factory=dict)
 
 
 class AgentsConfig(Base):
