@@ -3,6 +3,7 @@
 import asyncio
 import json
 import uuid
+from contextlib import AsyncExitStack
 from pathlib import Path
 from typing import Any
 
@@ -34,6 +35,7 @@ class SubagentManager:
         web_proxy: str | None = None,
         exec_config: "ExecToolConfig | None" = None,
         restrict_to_workspace: bool = False,
+        mcp_servers: dict | None = None
     ):
         from nanobot.config.schema import ExecToolConfig
         self.provider = provider
@@ -47,6 +49,7 @@ class SubagentManager:
         self.web_proxy = web_proxy
         self.exec_config = exec_config or ExecToolConfig()
         self.restrict_to_workspace = restrict_to_workspace
+        self.mcp_servers = mcp_servers or {}
         self._running_tasks: dict[str, asyncio.Task[None]] = {}
         self._session_tasks: dict[str, set[str]] = {}  # session_key -> {task_id, ...}
 
@@ -91,7 +94,6 @@ class SubagentManager:
     ) -> None:
         """Execute the subagent task and announce the result."""
         logger.info("Subagent [{}] starting task: {}", task_id, label)
-
         try:
             # Build subagent tools (no message tool, no spawn tool)
             tools = ToolRegistry()
@@ -108,66 +110,82 @@ class SubagentManager:
             ))
             tools.register(WebSearchTool(api_key=self.brave_api_key, proxy=self.web_proxy))
             tools.register(WebFetchTool(proxy=self.web_proxy))
-            
-            system_prompt = self._build_subagent_prompt()
-            messages: list[dict[str, Any]] = [
-                {"role": "system", "content": system_prompt},
-                {"role": "user", "content": task},
-            ]
+            mcp_stack = AsyncExitStack()
+            await mcp_stack.__aenter__()
+            try:
+                if self.mcp_servers:
+                    try:
+                        from nanobot.agent.tools.mcp import connect_mcp_servers
 
-            # Run agent loop (limited iterations)
-            max_iterations = 15
-            iteration = 0
-            final_result: str | None = None
+                        await connect_mcp_servers(self.mcp_servers, tools, mcp_stack)
+                    except Exception as e:
+                        logger.error("Subagent [{}] failed to connect MCP servers: {}", task_id, e)
 
-            while iteration < max_iterations:
-                iteration += 1
+                system_prompt = self._build_subagent_prompt()
+                messages: list[dict[str, Any]] = [
+                    {"role": "system", "content": system_prompt},
+                    {"role": "user", "content": task},
+                ]
 
-                response = await self.provider.chat(
-                    messages=messages,
-                    tools=tools.get_definitions(),
-                    model=self.model,
-                    temperature=self.temperature,
-                    max_tokens=self.max_tokens,
-                    reasoning_effort=self.reasoning_effort,
-                )
+                # Run agent loop (limited iterations)
+                max_iterations = 15
+                iteration = 0
+                final_result: str | None = None
 
-                if response.has_tool_calls:
-                    # Add assistant message with tool calls
-                    tool_call_dicts = [
-                        {
-                            "id": tc.id,
-                            "type": "function",
-                            "function": {
-                                "name": tc.name,
-                                "arguments": json.dumps(tc.arguments, ensure_ascii=False),
-                            },
-                        }
-                        for tc in response.tool_calls
-                    ]
-                    messages.append({
-                        "role": "assistant",
-                        "content": response.content or "",
-                        "tool_calls": tool_call_dicts,
-                    })
+                while iteration < max_iterations:
+                    iteration += 1
 
-                    # Execute tools
-                    for tool_call in response.tool_calls:
-                        args_str = json.dumps(tool_call.arguments, ensure_ascii=False)
-                        logger.debug("Subagent [{}] executing: {} with arguments: {}", task_id, tool_call.name, args_str)
-                        result = await tools.execute(tool_call.name, tool_call.arguments)
+                    response = await self.provider.chat(
+                        messages=messages,
+                        tools=tools.get_definitions(),
+                        model=self.model,
+                        temperature=self.temperature,
+                        max_tokens=self.max_tokens,
+                        reasoning_effort=self.reasoning_effort,
+                    )
+
+                    if response.has_tool_calls:
+                        # Add assistant message with tool calls
+                        tool_call_dicts = [
+                            {
+                                "id": tc.id,
+                                "type": "function",
+                                "function": {
+                                    "name": tc.name,
+                                    "arguments": json.dumps(tc.arguments, ensure_ascii=False),
+                                },
+                            }
+                            for tc in response.tool_calls
+                        ]
                         messages.append({
-                            "role": "tool",
-                            "tool_call_id": tool_call.id,
-                            "name": tool_call.name,
-                            "content": result,
+                            "role": "assistant",
+                            "content": response.content or "",
+                            "tool_calls": tool_call_dicts,
                         })
-                else:
-                    final_result = response.content
-                    break
 
-            if final_result is None:
-                final_result = "Task completed but no final response was generated."
+                        # Execute tools
+                        for tool_call in response.tool_calls:
+                            args_str = json.dumps(tool_call.arguments, ensure_ascii=False)
+                            logger.debug("Subagent [{}] executing: {} with arguments: {}", task_id, tool_call.name, args_str)
+                            result = await tools.execute(tool_call.name, tool_call.arguments)
+                            messages.append({
+                                "role": "tool",
+                                "tool_call_id": tool_call.id,
+                                "name": tool_call.name,
+                                "content": result,
+                            })
+                    else:
+                        final_result = response.content
+                        break
+
+                if final_result is None:
+                    final_result = "Task completed but no final response was generated."
+            finally:
+                try:
+                    await mcp_stack.aclose()
+                except (RuntimeError, BaseExceptionGroup) as e:
+                    # MCP SDK cleanup can surface TaskGroup noise; ignore it.
+                    logger.debug("Subagent [{}] ignored MCP cleanup error: {}", task_id, e)
 
             logger.info("Subagent [{}] completed successfully", task_id)
             await self._announce_result(task_id, label, task, final_result, origin, "ok")
